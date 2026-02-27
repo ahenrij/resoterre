@@ -206,3 +206,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Developer/inspection scripts not part of the pipeline
+scripts/preprocessing/dev/
+
+# Local development config overrides (contain machine-specific paths)
+configs/**/*.dev.yaml

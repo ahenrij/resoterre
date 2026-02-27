@@ -12,6 +12,7 @@ import xarray
 from resoterre.config_utils import config_from_yaml, known_configs
 from resoterre.data_management.netcdf_utils import CFVariables
 from resoterre.datasets.hrdps.hrdps_variables import hrdps_variables
+from resoterre.datasets.rdps.rdps_preprocessing_utils import create_preprocessed_batch
 from resoterre.hybrid_data_loaders.rdps_to_hrdps import post_process_model_output
 from resoterre.logging_utils import start_root_logger
 from resoterre.ml.network_manager import NeuralNetworksManager, NeuralNetworksManagerConfig
@@ -138,6 +139,83 @@ class RDPSToHRDPSOnDiskConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RDPSToHRDPSPreprocessingConfig:
+    """
+    Configuration for RDPS to HRDPS preprocessing.
+
+    Attributes
+    ----------
+    path_logs : Path, optional
+        Path to the logs directory.
+    path_output : Path, optional
+        Path to the output directory where preprocessed data will be saved.
+    path_rdps : Path, optional
+        Path to the raw RDPS data directory.
+    path_rdps_regrid : Path, optional
+        Path to the pre-regridded RDPS variable files (production pipeline).
+    path_hrdps : Path, optional
+        Path to the raw HRDPS data directory (for validation/target data).
+    path_rdps_climatology : Path, optional
+        Path to the RDPS climatology data directory.
+    path_hrdps_climatology : Path, optional
+        Path to the HRDPS climatology data directory.
+    path_hrdps_mask : Path, optional
+        Path to the HRDPS mask file.
+    path_hrdps_mf : Path, optional
+        Path to the HRDPS topography file.
+    path_hrdps_sftlf : Path, optional
+        Path to the HRDPS land-sea mask file.
+    path_grids : Path, optional
+        Path to the grids directory.
+    grid_input_for_ml : str, optional
+        Grid name for input data in machine learning.
+    grid_output_for_ml : str, optional
+        Grid name for output data in machine learning.
+    start_datetime : datetime.datetime, optional
+        Start datetime for data processing.
+    end_datetime : datetime.datetime, optional
+        End datetime for data processing.
+    rdps_variables : list[str]
+        List of RDPS variable names to process.
+    hrdps_variables : list[str]
+        List of HRDPS variable names to process.
+    normalize : bool
+        Whether to normalize the data.
+    save_batch_size : int
+        Batch size for saving preprocessed data.
+    anomaly_variables : list[str]
+        List of variable names to be treated as anomalies.
+    temporal_window : int, optional
+        Temporal window size for including context.
+    variables_with_temporal_context : list[str]
+        List of variable names that should include temporal context.
+    """
+
+    path_logs: Path | None = None
+    path_output: Path | None = None
+    path_rdps: Path | None = None
+    path_rdps_regrid: Path | None = None
+    path_hrdps: Path | None = None
+    path_rdps_climatology: Path | None = None
+    path_hrdps_climatology: Path | None = None
+    path_hrdps_mask: Path | None = None
+    path_hrdps_mf: Path | None = None
+    path_hrdps_sftlf: Path | None = None
+    path_grids: Path | None = None
+    grid_input_for_ml: str | None = None
+    grid_output_for_ml: str | None = None
+    start_datetime: datetime.datetime | None = None
+    end_datetime: datetime.datetime | None = None
+    rdps_variables: list[str] = field(default_factory=list)
+    hrdps_variables: list[str] = field(default_factory=list)
+    normalize: bool = True
+    save_batch_size: int = 1
+    anomaly_variables: list[str] = field(default_factory=list)
+    temporal_window: int | None = None
+    variables_with_temporal_context: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
 class RDPSToHRDPSInferenceConfig:
     """
     Configuration for RDPS to HRDPS inference.
@@ -172,6 +250,127 @@ class RDPSToHRDPSInferenceConfig:
     device: str = "cpu"
 
 
+def preprocessing_raw_to_preprocessed(
+    config: RDPSToHRDPSPreprocessingConfig | dict[str, Any] | Path | str,
+) -> list[str]:
+    """
+    Workflow for preprocessing raw RDPS data into the format required for inference.
+
+    This function converts raw RDPS meteorological data files into preprocessed NetCDF batches
+    that can be directly used by the inference pipeline.
+
+    Parameters
+    ----------
+    config : RDPSToHRDPSPreprocessingConfig | dict[str, Any] | Path | str
+        Configuration for the preprocessing process, including as a dictionary or a path to a YAML file.
+
+    Returns
+    -------
+    list[str]
+        List of paths to the saved preprocessed batch files.
+
+    Notes
+    -----
+    The preprocessing steps include:
+    1. Load raw RDPS data files
+    2. Regrid to the target ML grid resolution
+    3. Apply normalization and anomaly processing
+    4. Create input tensors with temporal context if needed
+    5. Save as NetCDF batches in the expected format
+
+    Expected output format matches what inference expects:
+    - input_first_block: (n_samples, in_channels, h_in, w_in)
+    - input_last_layer: (n_samples, last_layer_channels, h_out, w_out)
+    - target (optional): (n_samples, target_channels, h_out, w_out)
+    - Coordinates: year, month, day, hour, lat, lon, etc.
+    """
+    if isinstance(config, RDPSToHRDPSPreprocessingConfig):
+        config_obj = config
+    else:
+        config_obj = config_from_yaml(
+            RDPSToHRDPSPreprocessingConfig, config, known_custom_config_dict=known_configs
+        )
+
+    if config_obj.path_rdps is None:
+        raise ValueError("path_rdps must be specified in the config for raw RDPS data.")
+    if config_obj.path_output is None:
+        raise ValueError("path_output must be specified in the config.")
+
+    templates = TemplateStore({"log_file": "${path_logs}/${timestamp}_preprocessing.log"})
+    templates.add_substitutes(path_logs=str(config_obj.path_logs))
+    if config_obj.path_logs is not None:
+        _ = start_root_logger(
+            templates=templates,
+            disable_loggers=[
+                "numba.core.byteflow",
+                "numba.core.ssa",
+                "numba.core.interpreter",
+                "matplotlib.font_manager",
+                "matplotlib.colorbar",
+            ],
+        )
+
+    print("\n" + "=" * 80)
+    print("PREPROCESSING PIPELINE - Raw RDPS to Preprocessed Format")
+    print("=" * 80 + "\n")
+    print(f"Input RDPS data path  : {config_obj.path_rdps}")
+    print(f"Pre-regridded path    : {config_obj.path_rdps_regrid}")
+    print(f"Climatology path      : {config_obj.path_rdps_climatology}")
+    print(f"Topography file (MF)  : {config_obj.path_hrdps_mf}")
+    print(f"Land-sea mask (sftlf) : {config_obj.path_hrdps_sftlf}")
+    print(f"Output path           : {config_obj.path_output}")
+    print(f"RDPS variables        : {config_obj.rdps_variables}")
+    print(f"HRDPS variables       : {config_obj.hrdps_variables}")
+    print(f"Anomaly variables     : {config_obj.anomaly_variables}")
+
+    # Resolve target grid sizes from config grid names
+    grid_sizes = {
+        "8km_north_america_ml": (256, 512),
+        "2km_north_america_ml": (1024, 2048),
+    }
+    h_in, w_in = grid_sizes.get(config_obj.grid_input_for_ml, (256, 512))
+    h_out, w_out = grid_sizes.get(config_obj.grid_output_for_ml, (1024, 2048))
+
+    # Scan raw RDPS files
+    rdps_path = Path(config_obj.path_rdps)
+    rdps_files = sorted(rdps_path.glob("*.nc"))
+    if not rdps_files:
+        raise FileNotFoundError(f"No NetCDF files found in {rdps_path}")
+
+    print(f"\nFound {len(rdps_files)} raw RDPS file(s)")
+
+    output_dir = Path(config_obj.path_output)
+    saved_files = []
+
+    for batch_idx, raw_file in enumerate(rdps_files):
+        print(f"\n[{batch_idx + 1}/{len(rdps_files)}] Processing {raw_file.name} ...")
+        output_path = output_dir / f"preprocessed_batch_{batch_idx:08d}.nc"
+
+        saved_file = create_preprocessed_batch(
+            raw_rdps_file=raw_file,
+            rdps_variables=config_obj.rdps_variables,
+            hrdps_variables=config_obj.hrdps_variables,
+            anomaly_variables=config_obj.anomaly_variables,
+            output_path=output_path,
+            h_in=h_in,
+            w_in=w_in,
+            h_out=h_out,
+            w_out=w_out,
+            path_rdps_regrid=Path(config_obj.path_rdps_regrid) if config_obj.path_rdps_regrid else None,
+            path_rdps_climatology=Path(config_obj.path_rdps_climatology) if config_obj.path_rdps_climatology else None,
+            path_hrdps_mf=Path(config_obj.path_hrdps_mf) if config_obj.path_hrdps_mf else None,
+            path_hrdps_sftlf=Path(config_obj.path_hrdps_sftlf) if config_obj.path_hrdps_sftlf else None,
+        )
+        print(f"  Saved: {saved_file}")
+        saved_files.append(saved_file)
+
+    print(f"\nPreprocessing complete! {len(saved_files)} file(s) written to {output_dir}")
+    print(f"\nNext step, run inference:")
+    print(f"  python scripts/inference/downscaling_inference_rdps_to_hrdps.py <config>")
+
+    return saved_files
+
+
 def save_model_output(
     config: RDPSToHRDPSInferenceConfig, data_sample: xarray.Dataset, output_variables: dict[str, np.ndarray]
 ) -> list[str]:
@@ -195,8 +394,8 @@ def save_model_output(
     if config.path_output is None:
         raise ValueError("config.path_output must be specified to save model output.")
     list_of_saved_files = []
-    for i in range(data_sample.dims["sample"]):
-        for j in range(data_sample.dims["target_channel"]):
+    for i in range(data_sample.sizes["sample"]):
+        for j in range(data_sample.sizes["target_channel"]):
             variable_name = str(data_sample["output_variables"].values[j])
             data = {}
             year = int(data_sample["year"].values[i])

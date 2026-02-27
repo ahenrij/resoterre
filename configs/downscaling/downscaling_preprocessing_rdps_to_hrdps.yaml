@@ -1,26 +1,21 @@
 preprocessing_command: |
-  snakemake -s scripts/hybrid_data_loaders/rdps_to_hrdps_on_disk.smk \
-    --config config_yaml=/path/to/downscaling_preprocessing_rdps_to_hrdps.yaml \
-    -j1 \
-    --directory=/path/to/workflow/outputs
+  python scripts/preprocessing/downscaling_preprocessing_rdps_to_hrdps.py \
+    configs/downscaling/downscaling_preprocessing_rdps_to_hrdps.yaml
 
 # workflow and output paths
-path_workflow: /path/to/workflow/
 path_logs: /path/to/logs
-path_figures: /path/to/figures
-path_rdps_regrid: /path/to/rdps_regrid
-path_hrdps_regrid: /path/to/hrdps_regrid
-path_ml_data: /path/to/ml_data
+path_output: /path/to/output/preprocessed  # Output for preprocessed batches
 
 # input data paths
-path_rdps: /path/to/rdps_data
-path_rdps_climatology: /path/to/rdps_climatology  # pre-computed, required if anomaly variables are used
-path_hrdps: /path/to/hrdps_data
-path_hrdps_climatology: /path/to/hrdps_climatology  # pre-computed, required if anomaly variables are used
-path_hrdps_mask: /path/to/hrdps_mask
-path_hrdps_mf: /path/to/hrdps_mf
-path_hrdps_sftlf: /path/to/hrdps_sftlf
+path_rdps: /path/to/RDPS                           # raw RDPS forecast files  {YYYYMMDDCC}_{FFF}.nc
+path_rdps_regrid: /path/to/RDPS_regrid             # pre-regridded variable files (fast path)
+path_rdps_climatology: /path/to/RDPS_climatology   # climatology files for anomaly variables
+path_hrdps_mf: /path/to/HRDPS_regrid/HRDPS_MF_2km_north_america_ml.nc      # topography
+path_hrdps_sftlf: /path/to/HRDPS_regrid/HRDPS_sftlf_2km_north_america_ml.nc  # land-sea mask
 path_grids: /path/to/grids
+path_hrdps: null
+path_hrdps_climatology: null
+path_hrdps_mask: null
 
 # settings
 random_seed: 0
@@ -34,12 +29,19 @@ end_datetime: "2024-05-30 18:00:00"
 rdps_variables:
   - TT_model_levels
   - PR
+  - UU_model_levels
+  - VV_model_levels
   - HU850
   - GZ500
   - PC
+  - PN
+  - UU850
+  - VV850
 hrdps_variables:
   - HRDPS_P_TT_10000
   - HRDPS_P_PR_SFC
+  - HRDPS_P_UUC_10000
+  - HRDPS_P_VVC_10000
 
 rdps_window_size: null  # e.g., 64 for 64x64 patches
 overlap_factor: null  # preferably a divisor of rdps_window_size
@@ -104,4 +106,4 @@ north_america_2km_grid_shape:
   rlon_size: 2048
 
 framework: pytorch
-framework_version: '2.9.0+cu130'
+framework_version: '2.10.0+cu128'
