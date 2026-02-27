@@ -383,7 +383,6 @@ def create_preprocessed_batch(
     # Determine valid time from the raw filename
     valid_time = valid_time_from_raw_filename(raw_rdps_file.name)
     n_input_channels = len(rdps_variables)
-    n_target_channels = len(hrdps_variables)
 
     print(f"  File     : {raw_rdps_file.name}")
     print(f"  Valid at : {valid_time}")
@@ -434,9 +433,6 @@ def create_preprocessed_batch(
     static = load_static_fields(path_hrdps_mf, path_hrdps_sftlf, h_out, w_out)
     input_last_layer = static[np.newaxis, :, :, :]  # (1, 2, h_out, w_out)
 
-    # Target: zeros (not needed for inference)
-    target = np.zeros((1, n_target_channels, h_out, w_out), dtype=np.float32)
-
     # --- Spatial / temporal coordinates ---
     dt = valid_time.astype("datetime64[s]").astype(object)
 
@@ -479,7 +475,6 @@ def create_preprocessed_batch(
     cf_vars = CFVariables()
     cf_vars.add("input_first_block", dims=("sample", "input_channel",      "height_in",  "width_in"),  data=input_data,       dtype=np.float32, zlib=True, complevel=4)
     cf_vars.add("input_last_layer",  dims=("sample", "last_layer_channel", "height_out", "width_out"), data=input_last_layer, dtype=np.float32, zlib=True, complevel=4)
-    cf_vars.add("target",            dims=("sample", "target_channel",     "height_out", "width_out"), data=target,           dtype=np.float32, zlib=True, complevel=4)
 
     ds_out = xarray.Dataset(
         data_vars=cf_vars,
