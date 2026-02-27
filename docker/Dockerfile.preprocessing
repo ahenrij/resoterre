@@ -1,0 +1,19 @@
+# Preprocessing Dockerfile for resoterre
+# This image is built on top of the base image and configured for running preprocessing
+
+FROM resoterre-base:latest
+
+# Set working directory
+WORKDIR /app
+
+# Copy the preprocessing script
+COPY scripts/preprocessing/downscaling_preprocessing_rdps_to_hrdps.py /app/scripts/preprocessing/
+
+# Set environment variables for preprocessing
+ENV PYTHONPATH=/app:$PYTHONPATH
+
+# The entrypoint expects a config file path as an argument
+ENTRYPOINT ["python3", "/app/scripts/preprocessing/downscaling_preprocessing_rdps_to_hrdps.py"]
+
+# Default config (can be overridden at runtime)
+CMD ["/app/configs/downscaling/downscaling_preprocessing_rdps_to_hrdps.yaml"]
