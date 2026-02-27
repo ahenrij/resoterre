@@ -1,4 +1,4 @@
-# RDPS to HRDPS Preprocessing
+# RDPS Preprocessing
 
 This directory contains the preprocessing pipeline that converts raw RDPS forecast files into preprocessed NetCDF batches ready for inference.
 
