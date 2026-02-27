@@ -344,7 +344,7 @@ def preprocessing_raw_to_preprocessed(
 
     for batch_idx, raw_file in enumerate(rdps_files):
         print(f"\n[{batch_idx + 1}/{len(rdps_files)}] Processing {raw_file.name} ...")
-        output_path = output_dir / f"preprocessed_batch_{batch_idx:08d}.nc"
+        output_path = output_dir / f"preprocessed_{raw_file.stem}.nc"
 
         saved_file = create_preprocessed_batch(
             raw_rdps_file=raw_file,
