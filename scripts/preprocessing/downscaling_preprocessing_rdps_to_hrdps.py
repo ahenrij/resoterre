@@ -2,10 +2,8 @@
 
 import argparse
 import logging
-from pathlib import Path
 
 from resoterre.experiments.rdps_to_hrdps_workflow import preprocessing_raw_to_preprocessed
-from resoterre.logging_utils import start_root_logger
 
 
 def parse_args() -> argparse.Namespace:

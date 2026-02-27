@@ -23,8 +23,6 @@ File naming conventions (observed from reference data):
 
 import re
 from pathlib import Path
-from typing import Any
-
 import numpy as np
 from scipy.ndimage import zoom
 import xarray
