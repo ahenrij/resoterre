@@ -1,12 +1,13 @@
 # Docker Setup for Resoterre
 
-This directory contains Docker configurations for running **Resoterre inference**.
+This directory contains Docker configurations for running **Resoterre preprocessing and inference**.
 
 ---
 
 ## Files
 
 * `Dockerfile.base`: Base image with all project dependencies installed.
+* `Dockerfile.preprocessing`: Preprocessing image that converts raw RDPS data into preprocessed NetCDF batches. See [`scripts/preprocessing/README.md`](../scripts/preprocessing/README.md) for full documentation.
 * `Dockerfile.inference`: Inference-specific image with the trained model baked in and the entrypoint configured.
 
 ---
