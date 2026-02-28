@@ -1,34 +1,37 @@
 """
 Utilities for preprocessing raw RDPS data into the format required for inference.
 
-Preprocessing pipeline (matching training):
-  1. Load variables from pre-regridded RDPS_regrid files  (256×512)
-     OR regrid on-the-fly from raw RDPS using scipy zoom (fallback)
-  2. Anomaly variables have already had the climatology subtracted in
-     RDPS_regrid/{var}_anomaly/ — or we subtract it here from the
-     RDPS_climatology/ files when starting from raw data.
-  3. Normalize per variable specifications (rdps_variables.py).
-  4. Load static fields (topography MF, land-sea mask sftlf) at 2km (1024×2048).
-  5. Assemble and save the preprocessed NetCDF batch.
+Preprocessing pipeline:
+  1. Load each variable from the raw RDPS file (native rotated-pole grid, 1076×1102).
+  2. For anomaly variables, subtract the daily climatology (path_rdps_climatology)
+     on the native grid before regridding.
+  3. Regrid to the 8km North America ML grid (256×512) using precomputed xESMF
+     nearest-neighbour sparse weights from path_grids.
+  4. Normalize per variable specifications (rdps_variables.py).
+  5. Load static fields (topography MF, land-sea mask sftlf) at 2km (1024×2048).
+  6. Assemble and save the preprocessed NetCDF batch.
 
-File naming conventions (observed from reference data):
+File naming conventions:
   Raw RDPS     : {path_rdps}/{YYYYMMDDCC}_{FFF}.nc
                    CC = run cycle (00), FFF = forecast hour (007…012)
-  Regridded    : {path_rdps_regrid}/{var_name}/{YYYYMMDDHH}.nc
-  Anomaly reg. : {path_rdps_regrid}/{var_name}_anomaly/{YYYYMMDDHH}.nc
   Climatology  : {path_rdps_climatology}/{var_name}/rdps_climatology_{var}_{MM-DD}T{HH}.nc
+  Weights      : {path_grids}/regridding_weights/rdps_ec_ml_import_full-8km_north_america_ml/*.nc
+  Grid         : {path_grids}/2km_north_america_ml.grid.nc  (output lat/lon coordinates)
   Static MF    : {path_hrdps_mf}          (single file, var: MF)
   Static sftlf : {path_hrdps_sftlf}       (single file, var: HRDPS_sftlf)
 """
 
+import logging
 import re
-from pathlib import Path
-import numpy as np
-from scipy.ndimage import zoom
 import xarray
+import numpy as np
+from pathlib import Path
+from scipy.sparse import csr_matrix
 from resoterre.data_management.netcdf_utils import CFVariables
 from resoterre.datasets.rdps.rdps_variables import rdps_variables as RDPS_VARIABLE_SPECS
 from resoterre.ml.data_loader_utils import normalize
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -66,15 +69,6 @@ def valid_time_from_raw_filename(filename: str) -> np.datetime64:
     return run_time + np.timedelta64(fhour, "h")
 
 
-def valid_time_to_regrid_stem(valid_time: np.datetime64) -> str:
-    """
-    Convert a valid time to the regridded filename stem.
-
-    E.g. np.datetime64('2024-01-01T07') → '2024010107'
-    """
-    dt = valid_time.astype("datetime64[s]").astype(object)
-    return f"{dt.year:04d}{dt.month:02d}{dt.day:02d}{dt.hour:02d}"
-
 
 def climatology_filename(var_name: str, valid_time: np.datetime64) -> str:
     """
@@ -106,40 +100,6 @@ def _read_first_spatial_var(ds: xarray.Dataset) -> np.ndarray:
             return data[0]
     raise ValueError(f"No 2D or 3D spatial variable found in dataset. vars={list(ds.data_vars)}")
 
-
-def load_from_regrid_files(
-    path_rdps_regrid: Path,
-    var_name: str,
-    valid_time: np.datetime64,
-    is_anomaly: bool,
-) -> np.ndarray:
-    """
-    Load a pre-regridded variable from RDPS_regrid files.
-
-    Returns a 2D array of shape (256, 512).
-
-    Parameters
-    ----------
-    path_rdps_regrid : Path
-        Root directory, e.g. '.../RDPS_regrid'.
-    var_name : str
-        Config variable name, e.g. 'GZ500', 'TT_model_levels', 'UU850'.
-    valid_time : np.datetime64
-        Valid datetime to look up.
-    is_anomaly : bool
-        If True, look in the '{var_name}_anomaly' sub-directory.
-    """
-    folder_name = f"{var_name}_anomaly" if is_anomaly else var_name
-    stem = valid_time_to_regrid_stem(valid_time)
-    file_path = path_rdps_regrid / folder_name / f"{stem}.nc"
-
-    if not file_path.exists():
-        raise FileNotFoundError(f"Regridded file not found: {file_path}")
-
-    ds = xarray.open_dataset(file_path, decode_timedelta=False)
-    data = _read_first_spatial_var(ds)
-    ds.close()
-    return data.astype(np.float32)
 
 
 def load_from_raw_rdps(
@@ -203,28 +163,63 @@ def load_climatology_field(
 
 
 # ---------------------------------------------------------------------------
-# Regridding (scipy zoom — fast approximation)
+# Regridding (xESMF sparse weights)
 # ---------------------------------------------------------------------------
 
-def regrid_field(data: np.ndarray, target_h: int, target_w: int, order: int = 1) -> np.ndarray:
-    """
-    Resize a 2D field to (target_h, target_w) using bilinear interpolation.
+# Flat size of the native RDPS rotated-pole grid (1076 rlat × 1102 rlon)
+_RDPS_NATIVE_GRID_SIZE = 1076 * 1102
 
-    Used as fallback when pre-regridded files are not available.
-    The production pipeline uses xESMF nearest_s2d weights (see path_grids).
+
+def load_regrid_weights(path_grids: Path) -> csr_matrix:
+    """
+    Load the precomputed xESMF nearest-neighbour sparse weights for regridding
+    from the native RDPS grid (1076×1102) to the 8km North America ML grid (256×512).
 
     Parameters
     ----------
-    data : np.ndarray
-        2D array of shape (h, w).
-    target_h, target_w : int
-        Target dimensions.
-    order : int
-        Interpolation order (1 = bilinear).
+    path_grids : Path
+        Root of the grids directory containing regridding_weights/.
+
+    Returns
+    -------
+    csr_matrix
+        Sparse weight matrix of shape (256*512, 1076*1102).
     """
-    if data.shape == (target_h, target_w):
-        return data
-    return zoom(data, [target_h / data.shape[0], target_w / data.shape[1]], order=order).astype(data.dtype)
+    weights_dir = path_grids / "regridding_weights" / "rdps_ec_ml_import_full-8km_north_america_ml"
+    weight_files = list(weights_dir.glob("*.nc"))
+    if not weight_files:
+        raise FileNotFoundError(f"No weight file found in {weights_dir}")
+    ds = xarray.open_dataset(weight_files[0])
+    row = ds["row"].values - 1  # 1-indexed -> 0-indexed
+    col = ds["col"].values - 1
+    S = ds["S"].values
+    ds.close()
+    n_target = row.size
+    return csr_matrix((S, (row, col)), shape=(n_target, _RDPS_NATIVE_GRID_SIZE))
+
+
+def apply_regrid_weights(
+    field: np.ndarray, weights: csr_matrix, target_h: int, target_w: int
+) -> np.ndarray:
+    """
+    Apply sparse regridding weights to a 2D (h, w) field.
+
+    Parameters
+    ----------
+    field : np.ndarray
+        2D array on the native RDPS grid (1076×1102).
+    weights : csr_matrix
+        Sparse weight matrix from load_regrid_weights().
+    target_h, target_w : int
+        Target spatial dimensions (e.g. 256, 512 for the 8km grid).
+
+    Returns
+    -------
+    np.ndarray
+        Regridded 2D array of shape (target_h, target_w).
+    """
+    regridded = weights @ field.ravel().astype(np.float64)
+    return regridded.reshape(target_h, target_w).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -249,12 +244,12 @@ def normalize_variable(data: np.ndarray, var_name: str, is_anomaly: bool = False
     lookup = f"{var_name}_anomaly" if is_anomaly and f"{var_name}_anomaly" in RDPS_VARIABLE_SPECS else var_name
 
     if lookup not in RDPS_VARIABLE_SPECS:
-        print(f"    Warning: No normalization spec for '{lookup}', using data min/max")
+        logger.warning("No normalization spec for '%s', using data min/max", lookup)
         return normalize(data, mode=(-1, 1))
 
     spec = RDPS_VARIABLE_SPECS[lookup]
     if spec.normalize_min is None or spec.normalize_max is None:
-        print(f"    Warning: normalize_min/max not set for '{lookup}', using data min/max")
+        logger.warning("normalize_min/max not set for '%s', using data min/max", lookup)
         return normalize(data, mode=(-1, 1))
 
     return normalize(
@@ -300,12 +295,12 @@ def load_static_fields(
         mf = ds["MF"].values.squeeze().astype(np.float32)  # (1024, 2048)
         ds.close()
         if mf.shape != (h_out, w_out):
-            mf = regrid_field(mf, h_out, w_out)
+            raise ValueError(f"Topography file has unexpected shape {mf.shape}, expected ({h_out}, {w_out})")
         # Normalize: clip & scale elevation to [-1, 1]
         # Spec: range roughly [-5, 5000] m, normalize over [0, 4000]
         static[0] = normalize(mf, mode=(-1, 1), valid_min=0.0, valid_max=4000.0)
     else:
-        print("  Warning: path_hrdps_mf not found – topography channel set to zeros")
+        logger.warning("path_hrdps_mf not found – topography channel set to zeros")
 
     # Channel 1 – land-sea mask (sftlf), already in [0, 1]
     if path_hrdps_sftlf is not None and Path(path_hrdps_sftlf).exists():
@@ -313,11 +308,11 @@ def load_static_fields(
         sftlf = ds["HRDPS_sftlf"].values.squeeze().astype(np.float32)  # (1024, 2048)
         ds.close()
         if sftlf.shape != (h_out, w_out):
-            sftlf = regrid_field(sftlf, h_out, w_out)
-        # Normalize [0, 1] → [-1, 1]
+            raise ValueError(f"Land-sea mask file has unexpected shape {sftlf.shape}, expected ({h_out}, {w_out})")
+        # Normalize [0, 1] -> [-1, 1]
         static[1] = normalize(sftlf, mode=(-1, 1), valid_min=0.0, valid_max=1.0)
     else:
-        print("  Warning: path_hrdps_sftlf not found – land-sea mask channel set to zeros")
+        logger.warning("path_hrdps_sftlf not found – land-sea mask channel set to zeros")
 
     return static
 
@@ -332,11 +327,11 @@ def create_preprocessed_batch(
     hrdps_variables: list[str],
     anomaly_variables: list[str],
     output_path: Path,
+    path_grids: Path,
     h_in: int = 256,
     w_in: int = 512,
     h_out: int = 1024,
     w_out: int = 2048,
-    path_rdps_regrid: Path | None = None,
     path_rdps_climatology: Path | None = None,
     path_hrdps_mf: Path | None = None,
     path_hrdps_sftlf: Path | None = None,
@@ -344,11 +339,9 @@ def create_preprocessed_batch(
     """
     Create a single preprocessed batch from one raw RDPS file.
 
-    For each variable:
-      - If path_rdps_regrid exists and the file is found → load from regrid files (fast).
-      - Otherwise → extract from raw RDPS → subtract climatology if needed
-        → regrid with scipy zoom (approximate).
-    Then normalizes and assembles the output NetCDF.
+    For each variable: extract from raw RDPS -> subtract climatology if anomaly
+    -> regrid to 8km using xESMF sparse weights -> normalize.
+    Then loads static fields and assembles the output NetCDF.
 
     Parameters
     ----------
@@ -362,12 +355,12 @@ def create_preprocessed_batch(
         Subset of rdps_variables to be treated as anomalies.
     output_path : Path
         Destination NetCDF file.
+    path_grids : Path
+        Root of the grids directory containing regridding_weights/ and *.grid.nc files.
     h_in, w_in : int
         Input spatial dimensions (8km grid: 256×512).
     h_out, w_out : int
         Output spatial dimensions (2km grid: 1024×2048).
-    path_rdps_regrid : Path or None
-        Root of pre-regridded variable directories.
     path_rdps_climatology : Path or None
         Root of climatology directories.
     path_hrdps_mf : Path or None
@@ -384,76 +377,55 @@ def create_preprocessed_batch(
     valid_time = valid_time_from_raw_filename(raw_rdps_file.name)
     n_input_channels = len(rdps_variables)
 
-    print(f"  File     : {raw_rdps_file.name}")
-    print(f"  Valid at : {valid_time}")
-    print(f"  Input grid  (8km): ({h_in}, {w_in})")
-    print(f"  Output grid (2km): ({h_out}, {w_out})")
+    logger.info("File: %s | valid at %s | input (%d, %d) | output (%d, %d)",
+                raw_rdps_file.name, valid_time, h_in, w_in, h_out, w_out)
+
+    # Load regridding weights once for all variables
+    weights = load_regrid_weights(path_grids)
 
     input_data = np.zeros((1, n_input_channels, h_in, w_in), dtype=np.float32)
 
     for i, var_name in enumerate(rdps_variables):
         is_anomaly = var_name in anomaly_variables
 
-        # Load
-        loaded_from_regrid = False
-        if path_rdps_regrid is not None:
-            try:
-                field = load_from_regrid_files(path_rdps_regrid, var_name, valid_time, is_anomaly)
-                loaded_from_regrid = True
-                source = "regrid files"
-            except FileNotFoundError:
-                pass  # fall through to raw loading
+        # Load from raw RDPS on the native grid (1076×1102)
+        field = load_from_raw_rdps(raw_rdps_file, var_name)
 
-        if not loaded_from_regrid:
-            field = load_from_raw_rdps(raw_rdps_file, var_name)  # native grid
+        # Subtract climatology before regridding (on native grid)
+        if is_anomaly:
+            clim = load_climatology_field(path_rdps_climatology, var_name, valid_time) \
+                if path_rdps_climatology else None
+            if clim is not None:
+                field = field - clim
+            else:
+                logger.warning("No climatology for '%s' at %s", var_name, valid_time)
 
-            # Subtract climatology before regridding (on native grid)
-            if is_anomaly:
-                clim = load_climatology_field(path_rdps_climatology, var_name, valid_time) \
-                    if path_rdps_climatology else None
-                if clim is not None:
-                    field = field - clim
-                else:
-                    print(f"    Warning: no climatology for '{var_name}' at {valid_time}")
-
-            field = regrid_field(field, h_in, w_in)
-            source = "raw+zoom"
+        # Regrid to 8km using xESMF sparse weights
+        field = apply_regrid_weights(field, weights, h_in, w_in)
 
         # --- Normalize ---
         normalized = normalize_variable(field, var_name, is_anomaly=is_anomaly)
         input_data[0, i] = normalized
 
         tag = "anomaly" if is_anomaly else "raw"
-        print(f"  [{i+1:2d}/{n_input_channels}] {var_name} ({tag}, {source}): "
-              f"range=[{field.min():.3g}, {field.max():.3g}] → "
-              f"norm=[{normalized.min():.3g}, {normalized.max():.3g}]")
+        logger.debug("[%2d/%d] %s (%s): range=[%.3g, %.3g] -> norm=[%.3g, %.3g]",
+                     i + 1, n_input_channels, var_name, tag,
+                     field.min(), field.max(), normalized.min(), normalized.max())
 
     # --- Static fields ---
-    print(f"\n  Loading static fields...")
+    logger.debug("Loading static fields...")
     static = load_static_fields(path_hrdps_mf, path_hrdps_sftlf, h_out, w_out)
     input_last_layer = static[np.newaxis, :, :, :]  # (1, 2, h_out, w_out)
 
     # --- Spatial / temporal coordinates ---
     dt = valid_time.astype("datetime64[s]").astype(object)
 
-    # 1D lat/lon from a loaded regridded file, or fallback to linspace
-    lat_1d = np.linspace(18.26, 79.64, h_out, dtype=np.float32)  # 2km grid extent
-    lon_1d = np.linspace(-158.14, -35.32, w_out, dtype=np.float32)
-
-    # Attempt to read exact coordinates from a regrid file
-    if path_rdps_regrid is not None:
-        try:
-            stem = valid_time_to_regrid_stem(valid_time)
-            any_var = rdps_variables[0]
-            is_anom = any_var in anomaly_variables
-            folder = f"{any_var}_anomaly" if is_anom else any_var
-            ref_file = path_rdps_regrid / folder / f"{stem}.nc"
-            if ref_file.exists():
-                ds_ref = xarray.open_dataset(ref_file, decode_timedelta=False)
-                # These are 8km coords; we'll re-use linspace for 2km output
-                ds_ref.close()
-        except Exception:
-            pass
+    # Read exact lat/lon from the 2km grid definition file
+    grid_file = path_grids / "2km_north_america_ml.grid.nc"
+    ds_grid = xarray.open_dataset(grid_file)
+    lat_1d = ds_grid["lat"].values.astype(np.float32)
+    lon_1d = ds_grid["lon"].values.astype(np.float32)
+    ds_grid.close()
 
     # --- Build CF dataset ---
     cf_coords = CFVariables()

@@ -23,11 +23,10 @@ Copy `configs/downscaling/downscaling_preprocessing_rdps_to_hrdps.yaml` and fill
 | Key | Description |
 |-----|-------------|
 | `path_rdps` | Directory of raw RDPS forecast files (`{YYYYMMDDCC}_{FFF}.nc`) |
-| `path_rdps_regrid` | Pre-regridded variable files at 256×512 (fast path; optional but recommended) |
-| `path_rdps_climatology` | Climatology files used to compute anomalies for `PN`, `GZ500`, `UU850`, `VV850` |
+| `path_rdps_climatology` | Climatology files used to subtract the mean for anomaly variables (`PN`, `GZ500`, `UU850`, `VV850`) |
 | `path_hrdps_mf` | Path to the topography file (`HRDPS_MF_2km_north_america_ml.nc`) |
 | `path_hrdps_sftlf` | Path to the land-sea mask file (`HRDPS_sftlf_2km_north_america_ml.nc`) |
-| `path_grids` | Directory containing grid definition files and regridding weights |
+| `path_grids` | Directory containing the grid definition files and xESMF regridding weights used to remap from the native RDPS grid to the 8km ML grid |
 | `path_output` | Output directory for preprocessed NetCDF batches |
 | `path_logs` | Directory for log files |
 
